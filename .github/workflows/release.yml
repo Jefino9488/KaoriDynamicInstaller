@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.7)'
+        required: true
+        default: 'v1.0.7'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create ZIP
+        run: |
+          zip -r KaoriosFrameworkPatcher_${{ steps.version.outputs.VERSION }}.zip \
+            META-INF customize.sh module.prop \
+            -x "*.git*" -x "*.github*" -x "*.idea*"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: Kaorios Framework Patcher ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## Kaorios Framework Patcher ${{ steps.version.outputs.VERSION }}
+            
+            A Magisk/DynamicInstaller module that patches framework.jar for:
+            - Play Integrity support
+            - Pixel device spoofing
+            - Google Photos unlimited storage
+            
+            ### Installation
+            Flash via Magisk Manager, KernelSU, or custom recovery.
+            
+            ### Credits
+            - [Kaorios Toolbox](https://github.com/Wuang26/Kaorios-Toolbox)
+            - [Dynamic Installer](https://github.com/BlassGO/DynamicInstaller)
+          files: |
+            KaoriosFrameworkPatcher_${{ steps.version.outputs.VERSION }}.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
