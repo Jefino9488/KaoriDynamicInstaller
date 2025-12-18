@@ -1,5 +1,11 @@
-# Kaorios Toolbox System Properties
 persist.sys.kaorios=kousei
-
-# Required for privapp permissions - leave value blank
 ro.control_privapp_permissions=
+
+ro.crypto.state=encrypted
+ro.boot.flash.locked=1
+ro.boot.veritymode=enforcing
+ro.boot.vbmeta.device_state=locked
+ro.boot.warranty_bit=0
+ro.secureboot.lockstate=locked
+ro.boot.verifiedbootstate=green
+sys.oem_unlock_allowed=0
