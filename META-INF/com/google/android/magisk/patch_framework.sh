@@ -15,20 +15,18 @@ FRAMEWORK_SRC="/system/framework/framework.jar"
 FRAMEWORK_JAR="$TMP/framework.jar"
 FRAMEWORK_PATCHED="$TMP/framework_patched.jar"
 
-get_last_smali_dir() {
+get_next_smali_dir() {
     local decompile_dir="$1"
-    local target_smali_dir="smali"
     local max_num=0
     for dir in "$decompile_dir"/smali_classes*; do
         if [ -d "$dir" ]; then
             local num=$(basename "$dir" | sed 's/smali_classes//')
             if echo "$num" | grep -qE '^[0-9]+$' && [ "$num" -gt "$max_num" ]; then
                 max_num=$num
-                target_smali_dir="smali_classes${num}"
             fi
         fi
     done
-    echo "$target_smali_dir"
+    echo "smali_classes$((max_num + 1))"
 }
 
 # Extract framework.jar
@@ -105,7 +103,6 @@ extract_utility_classes() {
     mkdir -p "$DEX_EXTRACT_DIR/smali"
     local dex_path="$KAORIOS_WORK_DIR/classes.dex"
     local baksmali_jar=""
-    # Search for baksmali - $TMP/baksmali.jar is extracted by customize.sh
     for jar in "$TMP/baksmali.jar" "$l/baksmali.jar" "$TMP/zbin/baksmali.jar" "$TMP/zbin/ugu/baksmali.jar"; do
         [ -f "$jar" ] && { baksmali_jar="$jar"; break; }
     done
@@ -126,36 +123,77 @@ ui_print "- Decompiling framework.jar..."
 mkdir -p "$FW_WORK_DIR"
 dynamic_apktool -decompile "$FRAMEWORK_JAR" -o "$FW_WORK_DIR" -ps || { ui_print "! Decompilation failed"; return 1; }
 
-# Inject utility classes
-ui_print "- Injecting utility classes..."
-inject_utility_classes() {
-    local decompile_dir="$1"
-    local target_smali_dir=$(get_last_smali_dir "$decompile_dir")
-    local target_dir="$decompile_dir/$target_smali_dir/com/android/internal/util/kaorios"
-    mkdir -p "$target_dir"
-    cp -r "$UTILS_DIR/kaorios"/* "$target_dir/"
-    return 0
-}
-inject_utility_classes "$FW_WORK_DIR" || return 1
+# Create new DEX directory for patched classes (avoids method limit issues)
+NEW_SMALI_DIR=$(get_next_smali_dir "$FW_WORK_DIR")
+NEW_SMALI_PATH="$FW_WORK_DIR/$NEW_SMALI_DIR"
+mkdir -p "$NEW_SMALI_PATH"
+ui_print "- Creating $NEW_SMALI_DIR "
 
-# Apply patches
+# Inject utility classes to new DEX
+ui_print "- Injecting utility classes..."
+mkdir -p "$NEW_SMALI_PATH/com/android/internal/util/kaorios"
+cp -r "$UTILS_DIR/kaorios"/* "$NEW_SMALI_PATH/com/android/internal/util/kaorios/"
+
+# Android 15 specific: Patch invoke-custom methods
+ANDROID_API=$(getprop ro.build.version.sdk 2>/dev/null || echo "0")
+if [ "$ANDROID_API" -eq 35 ]; then
+    ui_print "- Android 15: patching invoke-custom methods..."
+
+    equals_patch='
+    .registers 2
+
+    const/4 v0, 0x0
+
+    return v0
+'
+
+    hashcode_patch='
+    .registers 1
+
+    const/4 v0, 0x0
+
+    return v0
+'
+
+    tostring_patch='
+    .registers 1
+
+    const/4 v0, 0x0
+
+    return-object v0
+'
+
+    target_files="KeyboardLayoutPreviewDrawable\$GlyphDrawable.smali
+PhysicalKeyLayout\$EnterKey.smali
+PhysicalKeyLayout\$LayoutKey.smali
+MediaRouter2\$InstanceInvalidatedCallbackRecord.smali
+MediaRouter2\$PackageNameUserHandlePair.smali"
+
+    echo "$target_files" | while IFS= read -r target_file; do
+        found_file=$(find "$FW_WORK_DIR" -name "$target_file" -type f 2>/dev/null | head -1)
+
+        if [ -n "$found_file" ] && grep -q "invoke-custom" "$found_file" 2>/dev/null; then
+            if grep -A 20 "\.method.*equals(Ljava/lang/Object;)Z" "$found_file" | grep -q "invoke-custom"; then
+                smali_kit -check -method "equals(Ljava/lang/Object;)Z" -file "$found_file" -remake "$equals_patch"
+            fi
+
+            if grep -A 20 "\.method.*hashCode()I" "$found_file" | grep -q "invoke-custom"; then
+                smali_kit -check -method "hashCode()I" -file "$found_file" -remake "$hashcode_patch"
+            fi
+
+            if grep -A 20 "\.method.*toString()Ljava/lang/String;" "$found_file" | grep -q "invoke-custom"; then
+                smali_kit -check -method "toString()Ljava/lang/String;" -file "$found_file" -remake "$tostring_patch"
+            fi
+        fi
+    done
+fi
+
+# Apply patches - move modified files to new DEX
 ui_print "- Applying framework patches..."
 
 patch_apm() {
     local target_file=$(find "$FW_WORK_DIR" -type f -path "*/android/app/ApplicationPackageManager.smali" | head -1)
     [ -z "$target_file" ] && return 0
-
-    local current_smali_dir=$(echo "$target_file" | sed -E 's|(.*/smali(_classes[0-9]*)?)/.*|\1|')
-    local last_smali_dir=$(get_last_smali_dir "$FW_WORK_DIR")
-    local target_root="$FW_WORK_DIR/$last_smali_dir"
-
-    if [ "$current_smali_dir" != "$target_root" ]; then
-        local new_dir="$target_root/android/app"
-        mkdir -p "$new_dir"
-        mv "$current_smali_dir"/android/app/ApplicationPackageManager*.smali "$new_dir/" 2>/dev/null
-        target_file="$new_dir/ApplicationPackageManager.smali"
-    fi
-
     grep -q "Lcom/android/internal/util/kaorios/KaoriFeatureOverrides" "$target_file" && return 0
 
     local method_start=$(grep -n "\.method.*hasSystemFeature(Ljava/lang/String;I)Z" "$target_file" | head -1 | cut -d: -f1)
@@ -185,6 +223,12 @@ KBLOCK
             rm -f "$block_file"
         fi
     fi
+
+    # Move patched file to new DEX with preserved directory structure
+    local source_dir=$(dirname "$target_file")
+    local rel_path=$(echo "$target_file" | sed -E 's|.*/smali(_classes[0-9]*)?/||' | xargs dirname)
+    mkdir -p "$NEW_SMALI_PATH/$rel_path"
+    mv "$source_dir"/ApplicationPackageManager*.smali "$NEW_SMALI_PATH/$rel_path/" 2>/dev/null
     return 0
 }
 
@@ -222,6 +266,11 @@ patch_instrumentation() {
             fi
         fi
     fi
+
+    # Move patched file to new DEX with preserved directory structure
+    local rel_path=$(echo "$target_file" | sed -E 's|.*/smali(_classes[0-9]*)?/||' | xargs dirname)
+    mkdir -p "$NEW_SMALI_PATH/$rel_path"
+    mv "$target_file" "$NEW_SMALI_PATH/$rel_path/" 2>/dev/null
     return 0
 }
 
@@ -245,6 +294,11 @@ patch_keystore2() {
             fi
         fi
     fi
+
+    # Move patched file to new DEX with preserved directory structure
+    local rel_path=$(echo "$target_file" | sed -E 's|.*/smali(_classes[0-9]*)?/||' | xargs dirname)
+    mkdir -p "$NEW_SMALI_PATH/$rel_path"
+    mv "$target_file" "$NEW_SMALI_PATH/$rel_path/" 2>/dev/null
     return 0
 }
 
@@ -277,6 +331,11 @@ patch_keystore_spi() {
             fi
         fi
     fi
+
+    # Move patched file to new DEX with preserved directory structure
+    local rel_path=$(echo "$target_file" | sed -E 's|.*/smali(_classes[0-9]*)?/||' | xargs dirname)
+    mkdir -p "$NEW_SMALI_PATH/$rel_path"
+    mv "$target_file" "$NEW_SMALI_PATH/$rel_path/" 2>/dev/null
     return 0
 }
 
@@ -288,7 +347,7 @@ patch_keystore_spi
 # Recompile
 ui_print "- Recompiling framework.jar..."
 sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-dynamic_apktool -recompile "$FW_WORK_DIR" -o "$FRAMEWORK_PATCHED" -j 2 -ps || { ui_print "! Recompilation failed"; return 1; }
+dynamic_apktool -recompile "$FW_WORK_DIR" -o "$FRAMEWORK_PATCHED" -j 2 -ps --no-debug-info || { ui_print "! Recompilation failed"; return 1; }
 
 # Install to module
 ui_print "- Installing to module..."
@@ -317,7 +376,7 @@ fi
     cp "$KAORIOS_WORK_DIR/privapp_whitelist_com.kousei.kaorios.xml" "$MODPATH/system/system_ext/etc/permissions/"
 }
 
-# Cleanup download cache
+# Cleanup
 ui_print "- Cleaning up..."
 rm -rf "$KAORIOS_CACHE_DIR" 2>/dev/null
 rm -rf "$KAORIOS_WORK_DIR" 2>/dev/null
